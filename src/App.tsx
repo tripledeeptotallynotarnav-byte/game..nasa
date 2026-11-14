@@ -19,6 +19,7 @@ import {
   ModuleUsageCounts,
 } from './data/campaignArc';
 import {
+  BuildingId,
   calculateNightCycle,
   createInitialMissionState,
   getSolChapter,
@@ -26,6 +27,7 @@ import {
   MAX_SOLS,
   MissionState,
   performModuleAction,
+  upgradeBuilding,
   resolveDilemmaChoice,
   resolveNightCycleStep,
 } from './game/simulation';
@@ -36,6 +38,7 @@ import { TitleScreen } from './components/TitleScreen';
 import { MarsViewport, MarsViewportHandle, ModulePopup } from './components/MarsViewport';
 import { CharacterPortrait } from './components/CharacterPortrait';
 import { EvaHelmetHud, EvaOpportunity } from './components/EvaInterface';
+import { CalibrationModal, ColonyProgression } from './components/ColonyProgression';
 import { ScienceTermButton } from './components/ScienceTermButton';
 import { EarthDispatchDrawer } from './components/EarthDispatchDrawer';
 import {
@@ -98,6 +101,7 @@ export default function App() {
     relativeBearing: 43,
     distance: 18,
   });
+  const [calibrationOpen, setCalibrationOpen] = useState(false);
 
   const viewportRef = useRef<MarsViewportHandle | null>(null);
   const evaPromptedSolRef = useRef(0);
@@ -220,6 +224,7 @@ export default function App() {
     setEvaActive(false);
     setEvaSolarCleaned(false);
     setEvaSampleFound(false);
+    setCalibrationOpen(false);
     evaPromptedSolRef.current = 0;
     setPhase('playing');
     setShowScienceLog(false);
@@ -248,7 +253,7 @@ export default function App() {
     (moduleId: ModuleId) => {
       if (isNightCycle || mission.pendingDilemma || mission.debrief) return;
 
-      const result = performModuleAction(mission.resources, moduleId);
+      const result = performModuleAction(mission.resources, moduleId, mission.buildingLevels);
       if (!result.applied) {
         missionAudio.playWarningKlaxon();
         showModulePopup(moduleId, result.feedbackText, false);
@@ -271,10 +276,49 @@ export default function App() {
       mission.pendingDilemma,
       mission.debrief,
       mission.resources,
+      mission.buildingLevels,
       showModulePopup,
       showHudDeltaBadges,
     ]
   );
+
+  const handleBuildingUpgrade = useCallback((building: BuildingId) => {
+    if (isNightCycle || mission.pendingDilemma || mission.debrief || evaActive) return;
+    const result = upgradeBuilding(mission.resources, mission.buildingLevels, building);
+    if (!result.applied) {
+      missionAudio.playWarningKlaxon();
+      showModulePopup(building, result.reason ?? 'Upgrade unavailable.', false);
+      return;
+    }
+    missionAudio.playClick();
+    setMission((previous) => ({
+      ...previous,
+      resources: result.nextResources,
+      buildingLevels: result.nextLevels,
+    }));
+    showModulePopup(building, `Tier ${result.nextLevels[building]} online · −${result.cost} kWh`, true);
+    showHudDeltaBadges(-result.cost, 0, 0);
+  }, [isNightCycle, mission.pendingDilemma, mission.debrief, mission.resources, mission.buildingLevels, evaActive, showModulePopup, showHudDeltaBadges]);
+
+  const handleCalibrationComplete = useCallback((accuracy: number) => {
+    const bonusPower = Math.round(4 + accuracy * 0.12);
+    const bonusScience = 2 + Math.floor(accuracy / 25);
+    setMission((previous) => {
+      if (previous.calibrationSol === previous.sol) return previous;
+      return {
+        ...previous,
+        calibrationSol: previous.sol,
+        resources: {
+          ...previous.resources,
+          powerKwh: Math.min(MAX_BATTERY_KWH, previous.resources.powerKwh + bonusPower),
+          sciencePoints: previous.resources.sciencePoints + bonusScience,
+        },
+      };
+    });
+    setCalibrationOpen(false);
+    showHudDeltaBadges(Math.min(MAX_BATTERY_KWH, mission.resources.powerKwh + bonusPower) - mission.resources.powerKwh, 0, 0);
+    showModulePopup('solar', `Calibration ${accuracy}% · +${bonusScience} science`, true);
+  }, [mission.resources.powerKwh, showHudDeltaBadges, showModulePopup]);
 
   const beginEva = () => {
     if (isNightCycle || mission.pendingDilemma || mission.debrief) return;
@@ -347,12 +391,14 @@ export default function App() {
     setIsNightCycle(true);
     setDispatchOpen(false);
 
-    const previewSummary = calculateNightCycle(
+    const       previewSummary = calculateNightCycle(
       mission.resources,
       mission.weather,
       mission.activeFlare,
-      chapter
+      chapter,
+      mission.buildingLevels
     );
+
 
     if (chapter.hazardType !== 'none') {
       missionAudio.playHazardImpact();
@@ -416,7 +462,7 @@ export default function App() {
   const powerPct = Math.round((mission.resources.powerKwh / MAX_BATTERY_KWH) * 100);
   const lifePct = Math.round(mission.resources.lifeSupportPct);
   const healthPct = Math.round(mission.resources.crewHealthPct);
-  const modalOpen = Boolean(mission.pendingDilemma || mission.debrief || showScienceLog || activeTerm);
+  const modalOpen = Boolean(mission.pendingDilemma || mission.debrief || showScienceLog || activeTerm || calibrationOpen);
   const isEmergency = emergencyMode !== 'none';
   const hasUnreadDispatch = !decryptedSols.includes(mission.sol);
 
@@ -455,6 +501,16 @@ export default function App() {
           solarCleaned={evaSolarCleaned}
           sampleFound={evaSampleFound}
           onExit={leaveEva}
+        />
+      )}
+      {!evaActive && !mission.debrief && (
+        <ColonyProgression
+          power={mission.resources.powerKwh}
+          levels={mission.buildingLevels}
+          calibratedThisSol={mission.calibrationSol === mission.sol}
+          disabled={Boolean(isNightCycle || mission.pendingDilemma || modalOpen)}
+          onUpgrade={handleBuildingUpgrade}
+          onStartCalibration={() => setCalibrationOpen(true)}
         />
       )}
 
@@ -768,6 +824,13 @@ export default function App() {
           </button>
         </div>
       </footer>}
+
+      {calibrationOpen && !mission.debrief && (
+        <CalibrationModal
+          onComplete={handleCalibrationComplete}
+          onClose={() => setCalibrationOpen(false)}
+        />
+      )}
 
       {/* Modals */}
       {mission.pendingDilemma && !mission.debrief && (

@@ -22,6 +22,24 @@ export interface MissionResources {
   sciencePoints: number;
 }
 
+export type BuildingId = 'solar' | 'moxie' | 'shelter' | 'biodome';
+export type BuildingLevels = Record<BuildingId, number>;
+export const MAX_BUILDING_LEVEL = 3;
+export const INITIAL_BUILDING_LEVELS: BuildingLevels = {
+  solar: 1,
+  moxie: 1,
+  shelter: 1,
+  biodome: 1,
+};
+
+export interface UpgradeResult {
+  applied: boolean;
+  reason?: string;
+  nextResources: MissionResources;
+  nextLevels: BuildingLevels;
+  cost: number;
+}
+
 export interface ModuleActionResult {
   applied: boolean;
   reason?: string;
@@ -68,6 +86,8 @@ export interface DebriefReport {
 export interface MissionState {
   sol: number;
   resources: MissionResources;
+  buildingLevels: BuildingLevels;
+  calibrationSol: number;
   weather: MedaSolWeather;
   activeFlare: NasaFlareRecord;
   pendingDilemma: DilemmaEvent | null;
@@ -102,6 +122,8 @@ export function createInitialMissionState(
   const activeFlare = pickFlareForSol(1, flares);
   return {
     sol: 1,
+    buildingLevels: { ...INITIAL_BUILDING_LEVELS },
+    calibrationSol: 0,
     resources: {
       powerKwh: 88,
       lifeSupportPct: 80,
@@ -129,12 +151,34 @@ export function createInitialMissionState(
   };
 }
 
+export function upgradeBuilding(
+  resources: MissionResources,
+  levels: BuildingLevels,
+  building: BuildingId
+): UpgradeResult {
+  const currentLevel = levels[building];
+  const cost = 18 + (currentLevel - 1) * 12;
+  if (currentLevel >= MAX_BUILDING_LEVEL) {
+    return { applied: false, reason: 'This outpost system is already fully upgraded.', nextResources: resources, nextLevels: levels, cost: 0 };
+  }
+  if (resources.powerKwh < cost) {
+    return { applied: false, reason: `Need ${cost} kWh to upgrade this system.`, nextResources: resources, nextLevels: levels, cost };
+  }
+  return {
+    applied: true,
+    nextResources: { ...resources, powerKwh: resources.powerKwh - cost },
+    nextLevels: { ...levels, [building]: currentLevel + 1 },
+    cost,
+  };
+}
+
 /**
  * Direct "On-Object" 3D module interactions with coupled "Zero Free Choices" trade-offs.
  */
 export function performModuleAction(
   resources: MissionResources,
-  moduleId: ModuleId
+  moduleId: ModuleId,
+  levels: BuildingLevels = INITIAL_BUILDING_LEVELS
 ): ModuleActionResult {
   if (moduleId === 'solar') {
     const waterCoolCost = 3;
@@ -153,7 +197,7 @@ export function performModuleAction(
     }
     const nextDust = clamp(resources.panelDustPct - 22, 0, 85);
     const dustDiff = nextDust - resources.panelDustPct;
-    const solarGain = dustDiff < -5 ? 14 : 10;
+    const solarGain = (dustDiff < -5 ? 14 : 10) + Math.max(0, levels.solar - 1) * 2;
     const nextPower = clamp(resources.powerKwh + solarGain, 0, MAX_BATTERY_KWH);
     const nextLife = clamp(resources.lifeSupportPct - waterCoolCost, 0, 100);
     return {
@@ -193,7 +237,7 @@ export function performModuleAction(
       };
     }
     const nextPower = clamp(resources.powerKwh - cost, 0, MAX_BATTERY_KWH);
-    const nextLife = clamp(resources.lifeSupportPct + 14, 0, 100);
+    const nextLife = clamp(resources.lifeSupportPct + 14 + Math.max(0, levels.moxie - 1) * 2, 0, 100);
     return {
       applied: true,
       nextResources: {
@@ -230,7 +274,7 @@ export function performModuleAction(
     const nextPower = clamp(resources.powerKwh - powerCost, 0, MAX_BATTERY_KWH);
     const nextLife = clamp(resources.lifeSupportPct - waterCost, 0, 100);
     const nextHealth = clamp(resources.crewHealthPct + 10, 0, 100);
-    const nextWall = clamp(resources.waterWallCm + 6, 8, 36);
+    const nextWall = clamp(resources.waterWallCm + 6 + Math.max(0, levels.shelter - 1) * 2, 8, 36);
     return {
       applied: true,
       nextResources: {
@@ -274,8 +318,9 @@ export function performModuleAction(
       powerKwh: nextPower,
       lifeSupportPct: nextLife,
       crewHealthPct: nextHealth,
-      cropGrowth: clamp(resources.cropGrowth + 1, 1, 5),
-      sciencePoints: resources.sciencePoints + 5,
+    cropGrowth: clamp(resources.cropGrowth + 1, 1, 5),
+    sciencePoints: resources.sciencePoints + 5 + Math.max(0, levels.biodome - 1),
+
     },
     deltaPower: nextPower - resources.powerKwh,
     deltaLife: nextLife - resources.lifeSupportPct,
@@ -293,12 +338,14 @@ export function calculateNightCycle(
   resources: MissionResources,
   weather: MedaSolWeather,
   activeFlare: NasaFlareRecord,
-  chapter: SolCampaignChapter
+  chapter: SolCampaignChapter,
+  levels: BuildingLevels = INITIAL_BUILDING_LEVELS
 ): NightCycleSummary {
   const tauFactor = clamp(1 - (weather.tau - 0.35) * 0.4, 0.35, 1.0);
   const dustFactor = clamp(1 - (resources.panelDustPct / 100) * 0.65, 0.38, 1.0);
-  const solarRechargeKwh = Math.round(45 * tauFactor * dustFactor);
-  const overnightDrawKwh = chapter.hazardType === 'cold' || weather.tempMinC <= -81 ? 26 : 22;
+  const solarRechargeKwh = Math.round(45 * tauFactor * dustFactor) + Math.max(0, levels.solar - 1) * 3;
+  const baseDraw = chapter.hazardType === 'cold' || weather.tempMinC <= -81 ? 26 : 22;
+  const overnightDrawKwh = Math.max(16, baseDraw - Math.max(0, levels.shelter - 1) * 2);
   const netPowerKwh = solarRechargeKwh - overnightDrawKwh;
 
   const netDustPct = Math.round(5 + weather.tau * 7);
@@ -445,7 +492,8 @@ export function resolveNightCycleStep(
     state.resources,
     state.weather,
     state.activeFlare,
-    chapter
+    chapter,
+    state.buildingLevels
   );
 
   // Water-wall naturally settles slightly overnight

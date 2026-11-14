@@ -7,6 +7,7 @@ import {
   getSolChapter,
   MAX_SOLS,
   performModuleAction,
+  upgradeBuilding,
   resolveDilemmaChoice,
   resolveNightCycleStep,
 } from './simulation';
@@ -52,6 +53,36 @@ test('on-object module actions apply coupled trade-offs directly', () => {
   assert.equal(bioRes.applied, true);
   assert.equal(bioRes.nextResources.cropGrowth, state.resources.cropGrowth + 1);
   assert.equal(bioRes.nextResources.sciencePoints, 5);
+});
+
+test('building upgrades spend power, cap at tier 3, and improve the next night cycle', () => {
+  const state = createInitialMissionState(VERIFIED_FALLBACK_FLARES);
+  const solarUpgrade = upgradeBuilding(state.resources, state.buildingLevels, 'solar');
+  assert.equal(solarUpgrade.applied, true);
+  assert.equal(solarUpgrade.cost, 18);
+  assert.equal(solarUpgrade.nextResources.powerKwh, state.resources.powerKwh - 18);
+  assert.equal(solarUpgrade.nextLevels.solar, 2);
+
+  const chapter = getSolChapter(state.sol);
+  const baseline = calculateNightCycle(state.resources, state.weather, state.activeFlare, chapter, state.buildingLevels);
+  const improved = calculateNightCycle(state.resources, state.weather, state.activeFlare, chapter, solarUpgrade.nextLevels);
+  assert.equal(improved.solarRechargeKwh, baseline.solarRechargeKwh + 3);
+
+  const noPower = upgradeBuilding({ ...state.resources, powerKwh: 5 }, state.buildingLevels, 'solar');
+  assert.equal(noPower.applied, false);
+  assert.equal(noPower.nextLevels.solar, 1);
+
+  const cappedLevels = { ...state.buildingLevels, biodome: 3 };
+  assert.equal(upgradeBuilding(state.resources, cappedLevels, 'biodome').applied, false);
+});
+
+test('building tiers strengthen direct module actions without replacing their core tradeoffs', () => {
+  const state = createInitialMissionState(VERIFIED_FALLBACK_FLARES);
+  const upgradedLevels = { ...state.buildingLevels, moxie: 2, shelter: 2, biodome: 2, solar: 2 };
+  assert.equal(performModuleAction(state.resources, 'moxie', upgradedLevels).deltaLife, 16);
+  assert.equal(performModuleAction(state.resources, 'shelter', upgradedLevels).deltaShieldCm, 8);
+  assert.equal(performModuleAction(state.resources, 'biodome', upgradedLevels).nextResources.sciencePoints, 6);
+  assert.equal(performModuleAction(state.resources, 'solar', upgradedLevels).deltaPower, 16);
 });
 
 test('thick Water-Wall deflects Sol 4 Solar Flare while thin wall suffers radiation damage', () => {
