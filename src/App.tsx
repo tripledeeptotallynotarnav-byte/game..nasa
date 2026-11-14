@@ -31,10 +31,11 @@ import {
 } from './game/simulation';
 import { DonkiFetchResult, fetchNasaDonkiTelemetry } from './utils/nasaApi';
 import { missionAudio } from './utils/audio';
-import { EmergencyMode } from './three/MarsOutpostScene';
+import { EmergencyMode, EvaObjective, EvaTelemetry } from './three/MarsOutpostScene';
 import { TitleScreen } from './components/TitleScreen';
 import { MarsViewport, MarsViewportHandle, ModulePopup } from './components/MarsViewport';
 import { CharacterPortrait } from './components/CharacterPortrait';
+import { EvaHelmetHud, EvaOpportunity } from './components/EvaInterface';
 import { ScienceTermButton } from './components/ScienceTermButton';
 import { EarthDispatchDrawer } from './components/EarthDispatchDrawer';
 import {
@@ -88,8 +89,18 @@ export default function App() {
   const [activeTerm, setActiveTerm] = useState<ScienceTerm | null>(null);
   const [activePopup, setActivePopup] = useState<ModulePopup | null>(null);
   const [hudDeltas, setHudDeltas] = useState<HudDeltas | null>(null);
+  const [evaOpportunity, setEvaOpportunity] = useState(false);
+  const [evaActive, setEvaActive] = useState(false);
+  const [evaSolarCleaned, setEvaSolarCleaned] = useState(false);
+  const [evaSampleFound, setEvaSampleFound] = useState(false);
+  const [evaTelemetry, setEvaTelemetry] = useState<EvaTelemetry>({
+    heading: 0,
+    relativeBearing: 43,
+    distance: 18,
+  });
 
   const viewportRef = useRef<MarsViewportHandle | null>(null);
+  const evaPromptedSolRef = useRef(0);
   const popupTimerRef = useRef<number | null>(null);
   const deltaTimerRef = useRef<number | null>(null);
 
@@ -137,6 +148,23 @@ export default function App() {
     [mission.sol, moduleUsage]
   );
 
+  useEffect(() => {
+    const hasFieldOpportunity =
+      (mission.resources.panelDustPct >= 34 && mission.sol % 2 === 1) || mission.sol % 4 === 0;
+    if (
+      phase === 'playing' &&
+      !mission.debrief &&
+      !mission.pendingDilemma &&
+      !isNightCycle &&
+      !evaActive &&
+      hasFieldOpportunity &&
+      evaPromptedSolRef.current !== mission.sol
+    ) {
+      evaPromptedSolRef.current = mission.sol;
+      setEvaOpportunity(true);
+    }
+  }, [phase, mission.sol, mission.resources.panelDustPct, mission.debrief, mission.pendingDilemma, isNightCycle, evaActive]);
+
   // Drive synthesized Martian ambient wind soundscape based on mission state
   useEffect(() => {
     missionAudio.setAmbientCondition({
@@ -179,6 +207,7 @@ export default function App() {
   }, []);
 
   const startMission = useCallback(() => {
+    viewportRef.current?.exitEva(false);
     clearTimers();
     setMission(createInitialMissionState(donkiResult.flares));
     setModuleUsage(INITIAL_USAGE);
@@ -187,6 +216,11 @@ export default function App() {
     setIsNightCycle(false);
     setActivePopup(null);
     setHudDeltas(null);
+    setEvaOpportunity(false);
+    setEvaActive(false);
+    setEvaSolarCleaned(false);
+    setEvaSampleFound(false);
+    evaPromptedSolRef.current = 0;
     setPhase('playing');
     setShowScienceLog(false);
     setActiveTerm(null);
@@ -242,8 +276,74 @@ export default function App() {
     ]
   );
 
-  const handleEndSolNightCycle = () => {
+  const beginEva = () => {
     if (isNightCycle || mission.pendingDilemma || mission.debrief) return;
+    const started = viewportRef.current?.enterEva() ?? false;
+    if (!started) return;
+    setEvaOpportunity(false);
+    setEvaSolarCleaned(false);
+    setEvaSampleFound(false);
+    setEvaActive(true);
+  };
+
+  const skipEva = () => {
+    evaPromptedSolRef.current = mission.sol;
+    setEvaOpportunity(false);
+  };
+
+  const handleEvaObjective = useCallback((objective: EvaObjective) => {
+    if (objective === 'solar') {
+      setEvaSolarCleaned(true);
+      missionAudio.playSolarServoSweep();
+      setMission((prev) => {
+        const nextDust = Math.max(0, prev.resources.panelDustPct - 28);
+        const nextPower = Math.min(MAX_BATTERY_KWH, prev.resources.powerKwh + 14);
+        return {
+          ...prev,
+          resources: {
+            ...prev.resources,
+            panelDustPct: nextDust,
+            powerKwh: nextPower,
+            sciencePoints: prev.resources.sciencePoints + 1,
+          },
+        };
+      });
+      showHudDeltaBadges(
+        Math.min(MAX_BATTERY_KWH, mission.resources.powerKwh + 14) - mission.resources.powerKwh,
+        0,
+        0
+      );
+      return;
+    }
+    setEvaSampleFound(true);
+    missionAudio.playBiodomeMist();
+  }, [mission.resources.powerKwh, showHudDeltaBadges]);
+
+  const handleEvaExit = useCallback(() => {
+    setEvaActive(false);
+    if (evaSampleFound) {
+      setMission((prev) => ({
+        ...prev,
+        resources: {
+          ...prev.resources,
+          lifeSupportPct: Math.min(100, prev.resources.lifeSupportPct + 6),
+          sciencePoints: prev.resources.sciencePoints + 8,
+        },
+      }));
+      showHudDeltaBadges(
+        0,
+        Math.min(100, mission.resources.lifeSupportPct + 6) - mission.resources.lifeSupportPct,
+        0
+      );
+    }
+    setEvaSampleFound(false);
+  }, [evaSampleFound, mission.resources.lifeSupportPct, showHudDeltaBadges]);
+
+  const leaveEva = () => viewportRef.current?.exitEva();
+
+  const handleEndSolNightCycle = () => {
+    if (isNightCycle || evaActive || mission.pendingDilemma || mission.debrief) return;
+    setEvaOpportunity(false);
     setIsNightCycle(true);
     setDispatchOpen(false);
 
@@ -333,10 +433,30 @@ export default function App() {
         targetModule={chapter.targetModule}
         emergencyMode={emergencyMode}
         isNightCycle={isNightCycle}
-        disabled={modalOpen}
+        disabled={modalOpen || evaActive}
         activePopup={activePopup}
         onModuleAction={handleModuleAction}
+        onEvaObjective={handleEvaObjective}
+        onEvaTelemetry={setEvaTelemetry}
+        onEvaExit={handleEvaExit}
+        evaActive={evaActive}
       />
+
+      <EvaOpportunity
+        visible={evaOpportunity && !evaActive}
+        sol={mission.sol}
+        onAccept={beginEva}
+        onSkip={skipEva}
+      />
+      {evaActive && (
+        <EvaHelmetHud
+          lifeSupport={mission.resources.lifeSupportPct}
+          telemetry={evaTelemetry}
+          solarCleaned={evaSolarCleaned}
+          sampleFound={evaSampleFound}
+          onExit={leaveEva}
+        />
+      )}
 
       {/* Minimal Translucent Top HUD Bar */}
       <header className="relative z-20 pointer-events-none px-2.5 sm:px-5 pt-2.5">
@@ -560,7 +680,7 @@ export default function App() {
       </header>
 
       {/* Bottom Dock: Optional Earth Audio Dispatch Drawer + Story Banner */}
-      <footer className="fixed bottom-2.5 sm:bottom-4 inset-x-2.5 sm:inset-x-5 z-20 pointer-events-none">
+      {!evaActive && <footer className="fixed bottom-2.5 sm:bottom-4 inset-x-2.5 sm:inset-x-5 z-20 pointer-events-none">
         <EarthDispatchDrawer
           open={dispatchOpen && !isNightCycle}
           currentSol={mission.sol}
@@ -647,7 +767,7 @@ export default function App() {
             </span>
           </button>
         </div>
-      </footer>
+      </footer>}
 
       {/* Modals */}
       {mission.pendingDilemma && !mission.debrief && (

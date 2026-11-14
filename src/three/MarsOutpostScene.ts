@@ -20,11 +20,32 @@ export interface ProjectedModuleAnchor {
   visible: boolean;
 }
 
+export type EvaObjective = 'solar' | 'sample';
+
+export interface EvaTelemetry {
+  heading: number;
+  relativeBearing: number;
+  distance: number;
+}
+
 export interface MarsSceneCallbacks {
   onModuleClick: (moduleId: ModuleId) => void;
   onHoverModule: (moduleId: ModuleId | null) => void;
   onAnchorsUpdate: (anchors: ProjectedModuleAnchor[]) => void;
+  onEvaObjective?: (objective: EvaObjective) => void;
+  onEvaTelemetry?: (telemetry: EvaTelemetry) => void;
+  onEvaExit?: () => void;
   onWebglError?: (reason: string) => void;
+}
+
+interface EvaCameraTransition {
+  elapsed: number;
+  duration: number;
+  fromPosition: THREE.Vector3;
+  toPosition: THREE.Vector3;
+  fromTarget: THREE.Vector3;
+  toTarget: THREE.Vector3;
+  returning: boolean;
 }
 
 interface ModulePulse {
@@ -179,6 +200,20 @@ export class MarsOutpostScene {
   private pointerDownPos = { x: 0, y: 0 };
   private hoveredModule: ModuleId | null = null;
   private highlightedTarget: ModuleId | 'any' = 'moxie';
+  private evaActive = false;
+  private evaTransition: EvaCameraTransition | null = null;
+  private evaReturnPosition = new THREE.Vector3();
+  private evaReturnTarget = new THREE.Vector3();
+  private evaPosition = new THREE.Vector3();
+  private evaKeys = new Set<string>();
+  private evaYaw = 0;
+  private evaPitch = 0;
+  private evaTelemetryElapsed = 0;
+  private evaToolHeld = false;
+  private evaToolProgress = 0;
+  private evaToolTarget: EvaObjective | null = null;
+  private evaCompleted = new Set<EvaObjective>();
+  private evaEffect: { mesh: THREE.Object3D; startedAt: number; duration: number } | null = null;
 
   private resources: MissionResources = {
     powerKwh: 88,
@@ -220,6 +255,9 @@ export class MarsOutpostScene {
     this.initScene();
     if (!this.renderer) return;
     this.bindEvents();
+    window.addEventListener('keydown', this.handleEvaKeyDown);
+    window.addEventListener('keyup', this.handleEvaKeyUp);
+    window.addEventListener('blur', this.handleEvaBlur);
     this.startLoop();
   }
 
@@ -1084,6 +1122,202 @@ export class MarsOutpostScene {
     }
   }
 
+  public enterEva(): boolean {
+    if (!this.renderer || !this.controls || this.destroyed) return false;
+    if (this.evaActive) return true;
+    this.evaActive = true;
+    this.evaKeys.clear();
+    this.evaCompleted.clear();
+    this.evaReturnPosition.copy(this.camera.position);
+    this.evaReturnTarget.copy(this.controls.target);
+    this.controls.enabled = false;
+    this.evaPosition.set(0, groundHeightAt(0, 3.2) + 1.72, 3.2);
+    this.evaYaw = 0;
+    this.evaPitch = -0.08;
+    this.beginEvaTransition(
+      this.evaPosition.clone(),
+      this.evaPosition.clone().add(new THREE.Vector3(0, -0.1, -5)),
+      false
+    );
+    return true;
+  }
+
+  public exitEva(notify = true): void {
+    if (!this.evaActive) return;
+    this.evaActive = false;
+    this.evaKeys.clear();
+    this.evaToolHeld = false;
+    if (document.pointerLockElement === this.renderer.domElement) document.exitPointerLock();
+    this.beginEvaTransition(this.evaReturnPosition, this.evaReturnTarget, true);
+    if (notify) this.callbacks.onEvaExit?.();
+  }
+
+  private beginEvaTransition(toPosition: THREE.Vector3, toTarget: THREE.Vector3, returning: boolean): void {
+    const fromTarget = new THREE.Vector3();
+    this.camera.getWorldDirection(fromTarget).add(this.camera.position);
+    this.evaTransition = {
+      elapsed: 0,
+      duration: 1.25,
+      fromPosition: this.camera.position.clone(),
+      toPosition: toPosition.clone(),
+      fromTarget,
+      toTarget: toTarget.clone(),
+      returning,
+    };
+  }
+
+  private handleEvaKeyDown = (event: KeyboardEvent): void => {
+    if (!this.evaActive) return;
+    const key = event.key.toLowerCase();
+    if (key === 'escape') {
+      event.preventDefault();
+      this.exitEva();
+      return;
+    }
+    if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', 'e'].includes(key)) {
+      event.preventDefault();
+      this.evaKeys.add(key);
+      if (key === 'e') this.evaToolHeld = true;
+    }
+  };
+
+  private handleEvaKeyUp = (event: KeyboardEvent): void => {
+    this.evaKeys.delete(event.key.toLowerCase());
+    if (event.key.toLowerCase() === 'e') this.evaToolHeld = false;
+  };
+
+  private handleEvaBlur = (): void => {
+    this.evaKeys.clear();
+    this.evaToolHeld = false;
+  };
+
+  private updateEva(dt: number): void {
+    if (this.evaTransition) {
+      const transition = this.evaTransition;
+      transition.elapsed = Math.min(transition.elapsed + dt, transition.duration);
+      const progress = transition.elapsed / transition.duration;
+      const eased = progress * progress * (3 - 2 * progress);
+      this.camera.position.lerpVectors(transition.fromPosition, transition.toPosition, eased);
+      const target = new THREE.Vector3().lerpVectors(transition.fromTarget, transition.toTarget, eased);
+      this.camera.lookAt(target);
+      if (progress >= 1) {
+        this.evaTransition = null;
+        if (transition.returning) {
+          this.controls.target.copy(this.evaReturnTarget);
+          this.controls.enabled = true;
+          this.controls.update();
+        }
+      }
+      return;
+    }
+    if (!this.evaActive) return;
+
+    const forward = (this.evaKeys.has('w') || this.evaKeys.has('arrowup') ? 1 : 0) -
+      (this.evaKeys.has('s') || this.evaKeys.has('arrowdown') ? 1 : 0);
+    const strafe = (this.evaKeys.has('d') || this.evaKeys.has('arrowright') ? 1 : 0) -
+      (this.evaKeys.has('a') || this.evaKeys.has('arrowleft') ? 1 : 0);
+    const moveLength = Math.hypot(forward, strafe);
+    if (moveLength > 0) {
+      const speed = 3.2 * dt / moveLength;
+      const nextX = THREE.MathUtils.clamp(this.evaPosition.x + (Math.sin(this.evaYaw) * forward + Math.cos(this.evaYaw) * strafe) * speed, -22, 22);
+      const nextZ = THREE.MathUtils.clamp(this.evaPosition.z + (-Math.cos(this.evaYaw) * forward + Math.sin(this.evaYaw) * strafe) * speed, -22, 22);
+      this.evaPosition.set(nextX, groundHeightAt(nextX, nextZ) + 1.72, nextZ);
+    }
+    const walking = moveLength > 0 ? Math.sin(this.totalTime * 8) * 0.035 : 0;
+    this.camera.position.set(this.evaPosition.x, this.evaPosition.y + walking, this.evaPosition.z);
+    this.camera.rotation.order = 'YXZ';
+    this.camera.rotation.set(this.evaPitch, this.evaYaw, 0);
+    this.evaTelemetryElapsed += dt;
+    if (this.evaTelemetryElapsed >= 0.12) {
+      this.evaTelemetryElapsed = 0;
+      const targetX = 12 - this.evaPosition.x;
+      const targetZ = -10 - this.evaPosition.z;
+      const heading = (THREE.MathUtils.radToDeg(this.evaYaw) + 360) % 360;
+      const bearing = (THREE.MathUtils.radToDeg(Math.atan2(targetX, -targetZ)) + 360) % 360;
+      this.callbacks.onEvaTelemetry?.({
+        heading: Math.round(heading),
+        relativeBearing: Math.round((bearing - heading + 360) % 360),
+        distance: Math.round(Math.hypot(targetX, targetZ)),
+      });
+    }
+
+    if (this.evaToolHeld) {
+      const solar = this.getEvaTarget('solar', new THREE.Vector3(-6.8, groundHeightAt(-6.8, 2.2) + 1.2, 2.2), 5.8);
+      const sample = this.getEvaTarget('sample', new THREE.Vector3(12, groundHeightAt(12, -10) + 1, -10), 4.5);
+      const target = solar ?? sample;
+      if (target && target !== this.evaToolTarget) {
+        this.evaToolTarget = target;
+        this.evaToolProgress = 0;
+      }
+      if (target) {
+        this.evaToolProgress += dt;
+        if (this.evaToolProgress >= 1.15) this.completeEvaObjective(target);
+      } else {
+        this.evaToolTarget = null;
+        this.evaToolProgress = 0;
+      }
+    } else {
+      this.evaToolTarget = null;
+      this.evaToolProgress = 0;
+    }
+  }
+
+  private getEvaTarget(objective: EvaObjective, point: THREE.Vector3, range: number): EvaObjective | null {
+    if (this.evaCompleted.has(objective) || this.evaPosition.distanceTo(point) > range) return null;
+    const direction = point.clone().sub(this.camera.position).normalize();
+    const lookDirection = new THREE.Vector3();
+    this.camera.getWorldDirection(lookDirection);
+    return lookDirection.dot(direction) > 0.35 ? objective : null;
+  }
+
+  private completeEvaObjective(objective: EvaObjective): void {
+    if (this.evaCompleted.has(objective)) return;
+    this.evaCompleted.add(objective);
+    this.evaToolHeld = false;
+    this.evaToolProgress = 0;
+    this.evaToolTarget = null;
+    if (objective === 'solar') this.triggerModuleFeedback('solar');
+    this.createEvaEffect(objective);
+    this.callbacks.onEvaObjective?.(objective);
+  }
+
+  private createEvaEffect(objective: EvaObjective): void {
+    if (this.evaEffect) {
+      this.scene.remove(this.evaEffect.mesh);
+      if (this.evaEffect.mesh instanceof THREE.Points) {
+        this.evaEffect.mesh.geometry.dispose();
+        (this.evaEffect.mesh.material as THREE.Material).dispose();
+      }
+    }
+    let mesh: THREE.Object3D;
+    if (objective === 'solar') {
+      const count = 54;
+      const positions = new Float32Array(count * 3);
+      for (let index = 0; index < count; index++) {
+        positions[index * 3] = (Math.random() - 0.5) * 3.4;
+        positions[index * 3 + 1] = Math.random() * 0.35;
+        positions[index * 3 + 2] = (Math.random() - 0.5) * 1.8;
+      }
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      const material = new THREE.PointsMaterial({ color: '#D89A73', size: 0.16, transparent: true, opacity: 0.8, depthWrite: false });
+      const particles = new THREE.Points(geometry, material);
+      particles.position.set(-6.8, groundHeightAt(-6.8, 2.2) + 1.6, 2.2);
+      mesh = particles;
+    } else {
+      const direction = new THREE.Vector3(0, 1, 0);
+      const beam = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.035, 0.11, 2.6, 8),
+        new THREE.MeshBasicMaterial({ color: '#67E8F9', transparent: true, opacity: 0.72, depthWrite: false })
+      );
+      beam.position.set(12, groundHeightAt(12, -10) + 1.3, -10);
+      beam.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction);
+      mesh = beam;
+    }
+    this.scene.add(mesh);
+    this.evaEffect = { mesh, startedAt: performance.now(), duration: 1.8 };
+  }
+
   public triggerModuleFeedback(moduleId: ModuleId): void {
     this.activePulse = {
       moduleId,
@@ -1097,6 +1331,10 @@ export class MarsOutpostScene {
     shieldBlockedFlare: boolean,
     onComplete: () => void
   ): void {
+    if (!this.renderer || !this.scene) {
+      onComplete();
+      return;
+    }
     if (this.nightAnim.active) return;
     this.nightAnim = {
       active: true,
@@ -1157,8 +1395,8 @@ export class MarsOutpostScene {
     if (this.destroyed || !this.renderer) return;
     const width = Math.max(this.container.clientWidth || window.innerWidth, 320);
     const height = Math.max(this.container.clientHeight || window.innerHeight, 320);
-    this.applyResponsiveCamera(width, height, true);
-    this.controls.update();
+    this.applyResponsiveCamera(width, height, !this.evaActive);
+    if (!this.evaActive) this.controls.update();
     this.renderer.setSize(width, height);
   };
 
@@ -1178,9 +1416,23 @@ export class MarsOutpostScene {
 
   private handlePointerDown = (e: PointerEvent): void => {
     this.pointerDownPos = { x: e.clientX, y: e.clientY };
+    if (this.evaActive) {
+      if (document.pointerLockElement !== this.renderer.domElement) {
+        void this.renderer.domElement.requestPointerLock();
+      }
+      this.evaToolHeld = true;
+      return;
+    }
   };
 
   private handlePointerMove = (e: PointerEvent): void => {
+    if (this.evaActive) {
+      if (document.pointerLockElement === this.renderer.domElement) {
+        this.evaYaw -= e.movementX * 0.0022;
+        this.evaPitch = THREE.MathUtils.clamp(this.evaPitch - e.movementY * 0.0018, -1.05, 0.75);
+      }
+      return;
+    }
     if (this.nightAnim.active) return;
     const hit = this.pickModule(e);
     if (hit !== this.hoveredModule) {
@@ -1198,6 +1450,14 @@ export class MarsOutpostScene {
   };
 
   private handlePointerUp = (e: PointerEvent): void => {
+    if (this.evaActive) {
+      this.evaToolHeld = false;
+      const solar = this.getEvaTarget('solar', new THREE.Vector3(-6.8, groundHeightAt(-6.8, 2.2) + 1.2, 2.2), 5.8);
+      const sample = this.getEvaTarget('sample', new THREE.Vector3(12, groundHeightAt(12, -10) + 1, -10), 4.5);
+      const target = solar ?? sample;
+      if (target) this.completeEvaObjective(target);
+      return;
+    }
     const travel = Math.hypot(e.clientX - this.pointerDownPos.x, e.clientY - this.pointerDownPos.y);
     if (travel > 6 || this.nightAnim.active) return;
     const hit = this.pickModule(e);
@@ -1261,7 +1521,8 @@ export class MarsOutpostScene {
       Math.min(1, dt * 1.5)
     );
 
-    this.controls.update();
+    this.updateEva(dt);
+    if (!this.evaActive && !this.evaTransition) this.controls.update();
     this.updateAnimations(dt);
     this.renderer.render(this.scene, this.camera);
     this.emitProjectedAnchors();
@@ -1276,6 +1537,32 @@ export class MarsOutpostScene {
   }
 
   private updateAnimations(dt: number): void {
+    if (this.evaEffect) {
+      const progress = (performance.now() - this.evaEffect.startedAt) / 1000 / this.evaEffect.duration;
+      if (this.evaEffect.mesh instanceof THREE.Points) {
+        const position = this.evaEffect.mesh.geometry.attributes.position as THREE.BufferAttribute;
+        for (let index = 0; index < position.count; index++) {
+          position.setY(index, position.getY(index) + dt * (0.45 + (index % 4) * 0.12));
+          position.setX(index, position.getX(index) + Math.sin(this.totalTime * 5 + index) * dt * 0.12);
+        }
+        position.needsUpdate = true;
+        (this.evaEffect.mesh.material as THREE.PointsMaterial).opacity = Math.max(0, 0.8 * (1 - progress));
+      } else if (this.evaEffect.mesh instanceof THREE.Mesh) {
+        (this.evaEffect.mesh.material as THREE.MeshBasicMaterial).opacity = Math.max(0, 0.72 * (1 - progress));
+      }
+      if (progress >= 1) {
+        this.scene.remove(this.evaEffect.mesh);
+        if (this.evaEffect.mesh instanceof THREE.Points) {
+          this.evaEffect.mesh.geometry.dispose();
+          (this.evaEffect.mesh.material as THREE.Material).dispose();
+        } else if (this.evaEffect.mesh instanceof THREE.Mesh) {
+          this.evaEffect.mesh.geometry.dispose();
+          (this.evaEffect.mesh.material as THREE.Material).dispose();
+        }
+        this.evaEffect = null;
+      }
+    }
+
     // Ambient MOXIE turbine rotation & rising O2 bubbles
     this.moxieFan.rotation.y += dt * 4.5;
     const bubbleSpeed = this.activePulse?.moduleId === 'moxie' ? 3.1 : 1.05;
@@ -1627,7 +1914,18 @@ export class MarsOutpostScene {
       dom.remove();
     }
     window.removeEventListener('resize', this.handleResize);
+    window.removeEventListener('keydown', this.handleEvaKeyDown);
+    window.removeEventListener('keyup', this.handleEvaKeyUp);
+    window.removeEventListener('blur', this.handleEvaBlur);
 
+    if (this.evaEffect) {
+      this.scene?.remove(this.evaEffect.mesh);
+      if (this.evaEffect.mesh instanceof THREE.Points || this.evaEffect.mesh instanceof THREE.Mesh) {
+        this.evaEffect.mesh.geometry.dispose();
+        (this.evaEffect.mesh.material as THREE.Material).dispose();
+      }
+      this.evaEffect = null;
+    }
     this.controls?.dispose();
     this.envRenderTarget?.dispose();
     this.pmremGenerator?.dispose();
