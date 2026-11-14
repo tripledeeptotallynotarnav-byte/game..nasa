@@ -3,6 +3,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { ModuleId, SolHazardType } from '../data/campaignArc';
 import { MissionResources } from '../game/simulation';
+import { createMarsAtmosphere, MarsAtmosphereUniforms } from './marsAtmosphere';
 import {
   createContactShadowTexture,
   createDustOverlayTexture,
@@ -114,6 +115,9 @@ export class MarsOutpostScene {
   private fog!: THREE.FogExp2;
   private starsPoints!: THREE.Points;
   private starsMat!: THREE.PointsMaterial;
+  private atmosphere!: THREE.Mesh<THREE.SphereGeometry, THREE.ShaderMaterial>;
+  private atmosphereUniforms!: MarsAtmosphereUniforms;
+  private nightBlend = 0;
 
   // Dynamic module references
   private solarTiltGroups: THREE.Group[] = [];
@@ -214,6 +218,7 @@ export class MarsOutpostScene {
     this.raycaster.layers.set(1);
 
     this.initScene();
+    if (!this.renderer) return;
     this.bindEvents();
     this.startLoop();
   }
@@ -259,6 +264,13 @@ export class MarsOutpostScene {
 
     this.scene = new THREE.Scene();
     this.scene.background = this.skyColor.clone();
+    const atmosphere = createMarsAtmosphere();
+    this.track(atmosphere.geometry);
+    this.track(atmosphere.material);
+    this.atmosphereUniforms = atmosphere.uniforms;
+    this.atmosphere = new THREE.Mesh(atmosphere.geometry, atmosphere.material);
+    this.atmosphere.frustumCulled = false;
+    this.scene.add(this.atmosphere);
     this.fog = new THREE.FogExp2(this.skyColor.getHex(), 0.0155);
     this.scene.fog = this.fog;
 
@@ -359,9 +371,10 @@ export class MarsOutpostScene {
 
   private buildMarsTerrain(): void {
     const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
-    const { map, bumpMap } = createMarsRegolithTextures(maxAniso);
+    const { map, bumpMap, normalMap } = createMarsRegolithTextures(maxAniso);
     this.track(map);
     this.track(bumpMap);
+    this.track(normalMap);
 
     const terrainGeo = this.track(new THREE.PlaneGeometry(110, 110, 72, 72));
     terrainGeo.rotateX(-Math.PI / 2);
@@ -377,7 +390,9 @@ export class MarsOutpostScene {
       new THREE.MeshStandardMaterial({
         map,
         bumpMap,
-        bumpScale: 0.25,
+        bumpScale: 0.12,
+        normalMap,
+        normalScale: new THREE.Vector2(0.18, 0.18),
         roughness: 0.92,
         metalness: 0.04,
       })
@@ -1234,6 +1249,18 @@ export class MarsOutpostScene {
     this.lastFrameTime = now;
     this.totalTime += dt;
 
+    this.atmosphere.position.copy(this.camera.position);
+    this.atmosphereUniforms.uTime.value = this.totalTime;
+    const stormIntensity = Math.max(
+      this.emergencyBlend,
+      THREE.MathUtils.clamp((this.currentTau - 0.35) / 1.1, 0, 0.75)
+    );
+    this.atmosphereUniforms.uStorm.value = THREE.MathUtils.lerp(
+      this.atmosphereUniforms.uStorm.value,
+      stormIntensity,
+      Math.min(1, dt * 1.5)
+    );
+
     this.controls.update();
     this.updateAnimations(dt);
     this.renderer.render(this.scene, this.camera);
@@ -1263,6 +1290,9 @@ export class MarsOutpostScene {
     const tiltAngle = 0.36 + Math.sin(this.totalTime * 0.6) * 0.05;
     for (let i = 0; i < this.solarTiltGroups.length; i++) {
       this.solarTiltGroups[i].rotation.x = tiltAngle;
+    }
+    for (let i = 0; i < this.biodomeCrops.length; i++) {
+      this.biodomeCrops[i].rotation.z = Math.sin(this.totalTime * 0.65 + i * 1.7) * 0.025;
     }
     if (this.targetRing.visible) {
       const pulse = 1 + Math.sin(this.totalTime * 3.8) * 0.045;
@@ -1341,6 +1371,9 @@ export class MarsOutpostScene {
           : this.emergencyMode === 'dust'
           ? this.dustAlertSkyColor
           : this.daySkyColor;
+      this.nightBlend = THREE.MathUtils.lerp(this.nightBlend, 0, Math.min(1, dt * 2.8));
+      this.atmosphereUniforms.uNight.value = this.nightBlend;
+      this.atmosphereUniforms.uSunGlow.value = 0.9 - this.emergencyBlend * 0.38;
       this.skyColor.lerp(baseDaySky, Math.min(1, dt * 7.5));
       (this.scene.background as THREE.Color).copy(this.skyColor);
       this.fog.color.copy(this.skyColor);
@@ -1460,6 +1493,9 @@ export class MarsOutpostScene {
       const t = Math.min(elapsedSec / this.nightAnim.duration, 1);
       // nightFactor peaks at 1.0 around t = 0.5
       const nightFactor = Math.sin(t * Math.PI);
+      this.nightBlend = THREE.MathUtils.lerp(this.nightBlend, nightFactor, Math.min(1, dt * 3.5));
+      this.atmosphereUniforms.uNight.value = this.nightBlend;
+      this.atmosphereUniforms.uSunGlow.value = 0.9 * (1 - this.nightBlend);
 
       // Sun arc across Jezero sky
       const sunAngle = t * Math.PI;
