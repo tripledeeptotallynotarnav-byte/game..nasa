@@ -3,6 +3,7 @@ import * as THREE from 'three';
 export function createMarsRegolithTextures(maxAnisotropy: number): {
   map: THREE.CanvasTexture;
   bumpMap: THREE.CanvasTexture;
+  normalMap: THREE.CanvasTexture;
 } {
   const size = 256;
   const colorCanvas = document.createElement('canvas');
@@ -54,6 +55,30 @@ export function createMarsRegolithTextures(maxAnisotropy: number): {
     ctx.stroke();
   }
 
+  const heightData = bCtx.getImageData(0, 0, size, size);
+  const normalCanvas = document.createElement('canvas');
+  normalCanvas.width = size;
+  normalCanvas.height = size;
+  const normalContext = normalCanvas.getContext('2d')!;
+  const normalData = normalContext.createImageData(size, size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const index = (y * size + x) * 4;
+      const left = heightData.data[(y * size + ((x + size - 1) % size)) * 4] / 255;
+      const right = heightData.data[(y * size + ((x + 1) % size)) * 4] / 255;
+      const up = heightData.data[(((y + size - 1) % size) * size + x) * 4] / 255;
+      const down = heightData.data[(((y + 1) % size) * size + x) * 4] / 255;
+      const nx = (left - right) * 2.2;
+      const ny = (up - down) * 2.2;
+      const length = Math.hypot(nx, ny, 1);
+      normalData.data[index] = ((nx / length) * 0.5 + 0.5) * 255;
+      normalData.data[index + 1] = ((ny / length) * 0.5 + 0.5) * 255;
+      normalData.data[index + 2] = ((1 / length) * 0.5 + 0.5) * 255;
+      normalData.data[index + 3] = 255;
+    }
+  }
+  normalContext.putImageData(normalData, 0, 0);
+
   const map = new THREE.CanvasTexture(colorCanvas);
   map.colorSpace = THREE.SRGBColorSpace;
   map.wrapS = THREE.RepeatWrapping;
@@ -67,7 +92,13 @@ export function createMarsRegolithTextures(maxAnisotropy: number): {
   bumpMap.repeat.set(10, 10);
   bumpMap.anisotropy = maxAnisotropy;
 
-  return { map, bumpMap };
+  const normalMap = new THREE.CanvasTexture(normalCanvas);
+  normalMap.wrapS = THREE.RepeatWrapping;
+  normalMap.wrapT = THREE.RepeatWrapping;
+  normalMap.repeat.set(10, 10);
+  normalMap.anisotropy = maxAnisotropy;
+
+  return { map, bumpMap, normalMap };
 }
 
 export function createSolarCellTexture(maxAnisotropy: number): THREE.CanvasTexture {
