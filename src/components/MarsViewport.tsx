@@ -4,6 +4,8 @@ import { ModuleId, SolHazardType } from '../data/campaignArc';
 import { MissionResources } from '../game/simulation';
 import {
   EmergencyMode,
+  EvaObjective,
+  EvaTelemetry,
   MarsOutpostScene,
   ProjectedModuleAnchor,
 } from '../three/MarsOutpostScene';
@@ -22,6 +24,8 @@ export interface MarsViewportHandle {
     shieldBlockedFlare: boolean,
     onComplete: () => void
   ) => void;
+  enterEva: () => boolean;
+  exitEva: (notify?: boolean) => void;
 }
 
 interface MarsViewportProps {
@@ -33,6 +37,10 @@ interface MarsViewportProps {
   disabled: boolean;
   activePopup: ModulePopup | null;
   onModuleAction: (moduleId: ModuleId) => void;
+  onEvaObjective: (objective: EvaObjective) => void;
+  onEvaTelemetry: (telemetry: EvaTelemetry) => void;
+  onEvaExit: () => void;
+  evaActive: boolean;
 }
 
 const MODULE_META: Record<
@@ -86,6 +94,10 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
       disabled,
       activePopup,
       onModuleAction,
+      onEvaObjective,
+      onEvaTelemetry,
+      onEvaExit,
+      evaActive,
     },
     ref
   ) => {
@@ -94,6 +106,12 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
 
     const onActionRef = useRef(onModuleAction);
     onActionRef.current = onModuleAction;
+    const onEvaObjectiveRef = useRef(onEvaObjective);
+    onEvaObjectiveRef.current = onEvaObjective;
+    const onEvaTelemetryRef = useRef(onEvaTelemetry);
+    onEvaTelemetryRef.current = onEvaTelemetry;
+    const onEvaExitRef = useRef(onEvaExit);
+    onEvaExitRef.current = onEvaExit;
 
     const disabledRef = useRef(disabled || isNightCycle);
     disabledRef.current = disabled || isNightCycle;
@@ -109,6 +127,8 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
       triggerNightCycle: (hazardType, shieldBlockedFlare, onComplete) => {
         sceneRef.current?.triggerNightCycle(hazardType, shieldBlockedFlare, onComplete);
       },
+      enterEva: () => sceneRef.current?.enterEva() ?? false,
+      exitEva: (notify = true) => sceneRef.current?.exitEva(notify),
     }));
 
     useEffect(() => {
@@ -124,6 +144,9 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
         onHoverModule: (moduleId) => {
           setHoveredId(moduleId);
         },
+        onEvaObjective: (objective) => onEvaObjectiveRef.current(objective),
+        onEvaTelemetry: (telemetry) => onEvaTelemetryRef.current(telemetry),
+        onEvaExit: () => onEvaExitRef.current(),
         onAnchorsUpdate: (next) => {
           setAnchors(next);
         },
@@ -165,7 +188,7 @@ export const MarsViewport = React.forwardRef<MarsViewportHandle, MarsViewportPro
         )}
 
         {/* Projected On-Object 3D Module Hotspots */}
-        {!isNightCycle && !webglError && (
+        {!isNightCycle && !webglError && !evaActive && (
           <div className="absolute inset-0 pointer-events-none z-10">
             {anchors.map((anchor) => {
               if (!anchor.visible) return null;
